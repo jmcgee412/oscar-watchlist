@@ -1,5 +1,5 @@
 /* Increment this cache version when you deploy changed app files. */
-const CACHE_NAME = 'oscar-watchlist-shell-v1';
+const CACHE_NAME = 'oscar-watchlist-shell-v2';
 const APP_SHELL = ['./','./index.html','./styles.css','./data.js','./app.js','./manifest.webmanifest','./icons/icon-192.png','./icons/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));
