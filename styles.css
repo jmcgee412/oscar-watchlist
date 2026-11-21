@@ -51,3 +51,14 @@ h1 em{font-weight:400;color:var(--gold);font-style:normal}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
 
 .category-people-check{display:flex;align-items:center;gap:7px;cursor:pointer}.category-people-check input{accent-color:var(--gold)}
+
+/* Shared-movie update preview (Version 3) */
+.import-changes{border:1px solid #455266;background:#121a29;border-radius:12px;margin:13px 0;padding:12px;max-height:40vh;overflow-y:auto}
+.import-changes h3{color:#f0d4a0;font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin:0 0 9px}
+.import-change{padding:10px 0;border-bottom:1px solid #303d4f;overflow-wrap:anywhere}
+.import-change:first-of-type{padding-top:3px}
+.import-change:last-child{border-bottom:none;padding-bottom:3px}
+.import-change-name{font-size:12px;font-weight:800;color:#f1f0ed;margin-bottom:6px}
+.import-before,.import-after{font-size:12px;line-height:1.5}
+.import-before{color:#aeb8c6}
+.import-after{color:#82e0b8;font-weight:650}

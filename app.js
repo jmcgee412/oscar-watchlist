@@ -11,6 +11,7 @@ let toastTimer;
 let editCategories = null;
 let drag = null;
 let pendingBackup = null;
+let pendingFilmImport = null;
 let beforeInstall = null;
 
 const ICONS = {
@@ -176,7 +177,7 @@ function showModal(contents,focusSelector){
   requestAnimationFrame(()=>{($modal.querySelector(focusSelector||'button, input, select, textarea')||$modal).focus();});
 }
 function closeModal(){
-  $overlay.hidden=true;$modal.innerHTML='';document.body.style.overflow='';editCategories=null;pendingBackup=null;
+  $overlay.hidden=true;$modal.innerHTML='';document.body.style.overflow='';editCategories=null;pendingBackup=null;pendingFilmImport=null;
 }
 function modalHead(title){return `<div class="modal-header"><h2 id="modalTitle">${title}</h2><button class="form-close" data-modal-close aria-label="Close">${ICONS.close}</button></div>`;}
 function categoryRow(c,selected,names=[]){
@@ -243,7 +244,7 @@ function deleteMovie(id){
 }
 function trailerUrl(movie){return 'https://www.youtube.com/results?search_query='+encodeURIComponent(`${movie.title} ${movie.year||''} official trailer`.replace(/\s+/g,' ').trim());}
 function packShare(movie){
-  return {v:1,title:movie.title,year:movie.year,rating:movie.rating,available:movie.available,availabilityDetails:movie.availabilityDetails,
+  return {v:1,title:movie.title,year:movie.year,rating:movie.rating,available:movie.available,availabilityDetails:movie.availabilityDetails,synopsis:movie.synopsis,
     categories:Object.entries(movie.nominations).map(([id,names])=>{const cat=state.categories.find(c=>c.id===id);return {id,label:cat?.label||id,people:cat?.people||false,names};})};
 }
 function encodePayload(payload){const binary=Array.from(new TextEncoder().encode(JSON.stringify(payload)),b=>String.fromCharCode(b)).join('');return btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
@@ -267,34 +268,96 @@ function validatedShare(raw){
   if(year!==null&&(!Number.isInteger(year)||year<1880||year>2100))throw Error('Invalid release year in link.');
   if(rating!==null&&(!Number.isFinite(rating)||rating<0||rating>10))throw Error('Invalid IMDb score in link.');
   if(typeof raw.availabilityDetails!=='string'||raw.availabilityDetails.length>240||typeof raw.available!=='boolean')throw Error('Invalid availability in link.');
+  // The synopsis field is optional, so older V1 share links remain valid.
+  if(raw.synopsis!==undefined&&(typeof raw.synopsis!=='string'||raw.synopsis.length>400))throw Error('Invalid synopsis in link.');
   if(!Array.isArray(raw.categories)||raw.categories.length>100)throw Error('Invalid category data.');
   const categories=raw.categories.map(c=>{
     if(!c||typeof c.id!=='string'||!/^[a-z0-9-]{1,80}$/.test(c.id)||typeof c.label!=='string'||!c.label.trim()||c.label.length>80||!Array.isArray(c.names)||c.names.length>10||c.names.some(n=>typeof n!=='string'||n.length>120))throw Error('Invalid category information.');
     return {id:c.id,label:c.label,people:c.people===true,names:c.names.map(n=>n.trim()).filter(Boolean)};
   });
-  return {title:raw.title.trim(),year,rating,available:raw.available,availabilityDetails:raw.availabilityDetails,categories};
+  if(new Set(categories.map(c=>c.id)).size!==categories.length)throw Error('Duplicate categories in movie link.');
+  return {title:raw.title.trim(),year,rating,available:raw.available,availabilityDetails:raw.availabilityDetails,
+    synopsis:raw.synopsis, categories};
 }
-function duplicateMovie(data){return state.movies.find(m=>normTitle(m.title)===normTitle(data.title)&&(m.year===data.year||m.year===null||data.year===null));}
+function duplicateMovie(data){
+  // Match exact release years first. Allow a missing year on either side for
+  // older watchlists whose original movies did not have years filled in.
+  const sameTitle=state.movies.filter(m=>normTitle(m.title)===normTitle(data.title));
+  const exact=sameTitle.find(m=>m.year===data.year);
+  if(exact)return exact;
+  const yearMissing=sameTitle.filter(m=>m.year===null||data.year===null);
+  return yearMissing.length===1?yearMissing[0]:null;
+}
+function shareNominations(data){
+  const noms={};
+  for(const c of data.categories)noms[c.id]=c.names;
+  return noms;
+}
+function nominationSummary(nominations, categories){
+  const labels=new Map(categories.map(c=>[c.id,c.label]));
+  return Object.entries(nominations).map(([id,names])=>`${labels.get(id)||id}${names.length?' — '+names.join(', '):''}`).join('; ')||'None';
+}
+function formatSharedAvailability(available,details){
+  return `${available?'Available':'Not Available'}${details?' ('+details+')':''}`;
+}
+function movieImportChanges(existing,data){
+  const changes=[];
+  const add=(label,before,after)=>{if(before!==after)changes.push({label,before:String(before),after:String(after)});};
+  add('Title',existing.title,data.title);
+  add('Release year',existing.year??'—',data.year??'—');
+  add('IMDb rating',existing.rating===null?'—':existing.rating.toFixed(1),data.rating===null?'—':data.rating.toFixed(1));
+  add('Availability',formatSharedAvailability(existing.available,existing.availabilityDetails),formatSharedAvailability(data.available,data.availabilityDetails));
+  if(data.synopsis!==undefined)add('Synopsis',existing.synopsis||'—',data.synopsis||'—');
+  const incoming=shareNominations(data);
+  // Compare category IDs and nominee names, not just their presentation order.
+  const normalized=nom=>JSON.stringify(Object.keys(nom).sort().map(id=>[id,nom[id]]));
+  if(normalized(existing.nominations)!==normalized(incoming)){
+    const allCategories=[...state.categories,...data.categories.filter(c=>!state.categories.some(x=>x.id===c.id))];
+    changes.push({label:'Award categories & names',before:nominationSummary(existing.nominations,state.categories),after:nominationSummary(incoming,allCategories)});
+  }
+  return changes;
+}
 function openImportPreview(data){
-  const duplicate=duplicateMovie(data);
+  const existing=duplicateMovie(data);
+  const sameTitle=state.movies.filter(m=>normTitle(m.title)===normTitle(data.title));
+  if(!existing && sameTitle.length && sameTitle.some(m=>m.year===null||data.year===null)){
+    toast('Several movies have this title. Resolve duplicates before importing.');return;
+  }
   const categoryNames=data.categories.map(c=>c.label+(c.names.length?' · '+c.names.join(', '):'')).join(' / ');
-  window._pendingFilmImport=data;
-  showModal(`${modalHead('Import <em>Movie</em>')}
+  const changes=existing?movieImportChanges(existing,data):[];
+  pendingFilmImport=data;
+  const changesMarkup=changes.length?`<div class="import-changes"><h3>Changes on this phone</h3>${changes.map(ch=>
+    `<div class="import-change"><div class="import-change-name">${esc(ch.label)}</div><div class="import-before">Current: ${esc(ch.before)}</div><div class="import-after">Incoming: ${esc(ch.after)}</div></div>`).join('')}</div>`:'';
+  showModal(`${modalHead(existing?'Update <em>Movie</em>':'Import <em>Movie</em>')}
     <div class="import-preview"><strong>${esc(data.title)}${data.year?` (${data.year})`:''}</strong>
-    <div>IMDb ${data.rating===null?'—':data.rating.toFixed(1)} · ${data.available?'Available':'Not Available'}${data.availabilityDetails?' ('+esc(data.availabilityDetails)+')':''}</div><div>${esc(categoryNames||'No award categories')}</div></div>
-    ${duplicate?`<div class="notice">This movie already appears in your watchlist as “${esc(duplicate.title)}”. Its existing rankings, watched status, and details will be kept.</div>`:'<p class="backup-info">The movie will be added as Not Watched at the bottom of your rankings. The sender’s personal rankings and watched status are not shared.</p>'}
-    <div class="modal-actions"><button class="secondary-btn" data-modal-close>Cancel</button>${duplicate?'<button class="primary-btn" data-modal-close>Keep Existing</button>':'<button class="primary-btn" id="confirmFilmImport">Add to Watchlist</button>'}</div>`);
+    <div>IMDb ${data.rating===null?'—':data.rating.toFixed(1)} · ${data.available?'Available':'Not Available'}${data.availabilityDetails?' ('+esc(data.availabilityDetails)+')':''}</div><div>${esc(categoryNames||'No award categories')}</div>${data.synopsis?`<div>${esc(data.synopsis)}</div>`:''}</div>
+    ${existing?(changes.length?
+      `<div class="notice">This movie is already in your watchlist. Confirm to update its movie information. <strong>Your watched status, ranking positions, and local movie ID are preserved.</strong></div>${changesMarkup}`:
+      '<div class="notice">This movie is already up to date. Nothing needs to be changed.</div>'):
+      '<p class="backup-info">The movie will be added as Not Watched at the bottom of your rankings. The sender’s personal rankings and watched status are not shared.</p>'}
+    <div class="modal-actions"><button class="secondary-btn" data-modal-close>${existing&&!changes.length?'Close':'Cancel'}</button>${!existing||changes.length?`<button class="primary-btn" id="confirmFilmImport">${existing?'Update Movie':'Add to Watchlist'}</button>`:''}</div>`);
 }
 function importFilm(data){
-  if(duplicateMovie(data)){toast('Movie already exists. Nothing imported.');return;}
-  const nominations={};
+  const existing=duplicateMovie(data);
+  if(existing&&!movieImportChanges(existing,data).length){closeModal();toast('Movie is already up to date.');return;}
+  // Add only new category definitions. Existing category settings belong to this phone.
+  const nominations=shareNominations(data);
   for(const c of data.categories){
-    const present=state.categories.find(cat=>cat.id===c.id);
-    if(!present)state.categories.push({id:c.id,label:c.label,people:c.people});
-    nominations[c.id]=c.names;
+    if(!state.categories.some(cat=>cat.id===c.id))state.categories.push({id:c.id,label:c.label,people:c.people});
   }
-  state.movies.push({id:makeId(),title:data.title,year:data.year,rating:data.rating,available:data.available,availabilityDetails:data.availabilityDetails,watched:false,synopsis:'',nominations});
-  updateAndRender();renderCategoryOptions();closeModal();toast('Shared movie added.');
+  if(existing){
+    const updated={...existing,title:data.title,year:data.year,rating:data.rating,available:data.available,
+      availabilityDetails:data.availabilityDetails,
+      synopsis:data.synopsis===undefined?existing.synopsis:data.synopsis,
+      nominations};
+    state.movies[state.movies.indexOf(existing)]=updated;
+  }else{
+    state.movies.push({id:makeId(),title:data.title,year:data.year,rating:data.rating,available:data.available,
+      availabilityDetails:data.availabilityDetails,watched:false,synopsis:data.synopsis??'',nominations});
+  }
+  // Repair only the category membership of rankings. Existing orders stay intact;
+  // a newly included movie is appended at the end of that category ranking.
+  updateAndRender();renderCategoryOptions();closeModal();toast(existing?'Shared movie information updated.':'Shared movie added.');
 }
 function importFromLink(raw){
   try{
@@ -324,7 +387,7 @@ function openSettings(){
     <div class="settings-section"><h3>Backup & restore</h3><p>Everything is stored only in this device’s browser storage. Export a JSON backup occasionally, especially before changing phones or clearing browser data.</p><div class="settings-buttons"><button class="primary-btn" id="exportBackup">Export JSON</button><button class="secondary-btn" id="importBackupBtn">Import JSON</button></div></div>
     <div class="settings-section"><h3>Import shared movie</h3><p>Use this if a text-message movie link opens in a different browser or needs to be pasted manually.</p><textarea id="pasteFilmURL" class="form-input" rows="2" placeholder="Paste the shared movie link here" aria-label="Shared movie link"></textarea><div class="settings-buttons" style="margin-top:9px"><button class="secondary-btn" id="importPasteBtn">Preview Movie</button></div></div>
     <div class="settings-section"><h3>Install & offline access</h3><p>Open this app using Chrome on Android, then select <strong>Add to Home screen</strong> or <strong>Install app</strong>. Once opened online, its files are cached for offline use. Each phone keeps separate data.</p><div class="settings-buttons" id="installContainer">${beforeInstall?'<button class="secondary-btn" id="installBtn">Install App</button>':''}</div></div>
-    <div class="backup-info">Version 1 · No accounts · No cloud sync · No automatic availability updates</div>`);
+    <div class="backup-info">Version 3 · No accounts · No cloud sync · Updates via shared links</div>`);
 }
 function handleBackupFile(file){
   if(!file)return;
@@ -418,7 +481,7 @@ $overlay.addEventListener('click',e=>{
   if(e.target.id==='exportBackup'){backupJSON();return;}
   if(e.target.id==='importBackupBtn'){el('backupFile').click();return;}
   if(e.target.id==='importPasteBtn'){const input=el('pasteFilmURL');const url=input?.value.trim();if(url)importFromLink(url);else toast('Paste a shared movie URL first.');return;}
-  if(e.target.id==='confirmFilmImport'){const data=window._pendingFilmImport;if(data)importFilm(data);return;}
+  if(e.target.id==='confirmFilmImport'){const data=pendingFilmImport;if(data)importFilm(data);return;}
   if(e.target.id==='confirmBackup'&&pendingBackup){state=pendingBackup;renderCategoryOptions();updateAndRender();closeModal();toast('JSON backup restored.');return;}
   if(e.target.id==='copyShare'){const box=el('shareFallback');box.focus();box.select();return;}
   if(e.target.id==='installBtn'&&beforeInstall){beforeInstall.prompt();beforeInstall.userChoice.then(()=>{beforeInstall=null;});return;}
